@@ -1,0 +1,37 @@
+# Build output
+bin/
+obj/
+__pycache__/
+*.pyc
+*.user
+*.suo
+
+# Local-only game/mod artifacts
+dist/
+extract_output/
+translations/
+
+# Runtime binaries and generated BepInEx data
+BepInEx/
+dotnet/
+*.dll
+*.pdb
+*.deps.json
+*.log
+
+# Game files and extracted game data
+BLUE PRINCE_Data/
+D3D12/
+GameAssembly.dll
+UnityPlayer.dll
+UnityCrashHandler64.exe
+BLUE PRINCE.exe
+baselib.dll
+winhttp.dll
+*.assets
+*.resS
+*.resource
+*.bundle
+
+# Keep public templates
+!templates/*.tsv
