@@ -11,6 +11,7 @@ using System.IO;
 using System.Text;
 using Il2CppGenList = Il2CppSystem.Collections.Generic.List<string>;
 using Il2CppTMPList = Il2CppSystem.Collections.Generic.List<TMPro.TMP_FontAsset>;
+using Il2CppInterop.Runtime.Injection;
 
 namespace BluePrinceJP
 {
@@ -43,6 +44,50 @@ namespace BluePrinceJP
             return false;
         }
         internal static TMP_FontAsset JaFont;
+
+        // --- Original(EN) / Japanese toggle ---
+        internal static BepInEx.Configuration.ConfigEntry<KeyCode> ToggleKey;
+        internal static bool ShowOriginal = false;
+        internal class TextSwap
+        {
+            public TMP_Text comp; public string orig; public string ja;
+            public TMP_FontAsset origFont; public Material origMat;
+        }
+        // Keyed by component InstanceID so re-translations overwrite instead of duplicating.
+        internal static readonly Dictionary<int, TextSwap> Swaps = new();
+
+        // Swap every recorded component between original English and Japanese, switching BOTH the
+        // text and the font/material. English uses the game's own font (NotoSansJP is wider for Latin
+        // and overflows). Runs inside the set_text guard so it doesn't recurse through our own patch.
+        internal static void ApplySwaps()
+        {
+            TmpTextSetTextPatch.SetInPatch(true);
+            try
+            {
+                var dead = new List<int>();
+                foreach (var kv in Swaps)
+                {
+                    var s = kv.Value;
+                    try
+                    {
+                        if (s.comp == null) { dead.Add(kv.Key); continue; }
+                        if (ShowOriginal)
+                        {
+                            if (s.origFont != null) { s.comp.font = s.origFont; s.comp.fontSharedMaterial = s.origMat; }
+                            s.comp.text = s.orig;
+                        }
+                        else
+                        {
+                            if (JaFont != null) { s.comp.font = JaFont; s.comp.fontSharedMaterial = JaFont.material; }
+                            s.comp.text = s.ja;
+                        }
+                    }
+                    catch { dead.Add(kv.Key); }
+                }
+                foreach (var d in dead) Swaps.Remove(d);
+            }
+            finally { TmpTextSetTextPatch.SetInPatch(false); }
+        }
 
         // Collection: English texts seen via TMP that aren't yet translated
         internal static readonly System.Collections.Generic.HashSet<string> CollectedGameTexts = new();
@@ -78,6 +123,11 @@ namespace BluePrinceJP
             DataDir = Path.Combine(Paths.BepInExRootPath, "BluePrinceJP");
             Directory.CreateDirectory(DataDir);
 
+            ToggleKey = Config.Bind("General", "ToggleOriginalTextKey", KeyCode.LeftControl,
+                "原文(英語)と日本語訳を切り替えるトグルキー。押すたびに切り替わる。" +
+                "Ctrl / Shift / Alt を指定した場合は左右どちらのキーでも有効。" +
+                "(KeyCode names, e.g. LeftControl, Tab, BackQuote)");
+
             LoadTranslations();
             LoadGameTranslations();
 
@@ -85,6 +135,18 @@ namespace BluePrinceJP
             Harmony.PatchAll();
 
             Log.LogInfo($"BluePrinceJP loaded — {JaTranslations.Count} UI, {GameJaTranslations.Count} game translations");
+
+            // Attach a behaviour that runs delayed layout diagnostics once Unity has laid text out
+            try
+            {
+                ClassInjector.RegisterTypeInIl2Cpp<BpjpRuntime>();
+                var rtGo = new GameObject("BPJP_Runtime");
+                UnityEngine.Object.DontDestroyOnLoad(rtGo);
+                rtGo.hideFlags = HideFlags.HideAndDontSave;
+                rtGo.AddComponent<BpjpRuntime>();
+                Log.LogInfo("[JP] Runtime behaviour attached");
+            }
+            catch (Exception e) { Log.LogWarning($"[JP] Diag attach failed: {e.Message}"); }
         }
 
         private static void LoadTranslations()
@@ -149,6 +211,7 @@ namespace BluePrinceJP
     {
         private static bool _inPatch = false;
         internal static bool IsInPatch => _inPatch;
+        internal static void SetInPatch(bool v) => _inPatch = v;
 
         [HarmonyPostfix]
         public static void Postfix(TMPro.TMP_Text __instance, string value)
@@ -180,45 +243,58 @@ namespace BluePrinceJP
                     _inPatch = true;
                     try
                     {
-                        // Skip the <size=80%> wrapper when the string already carries layout-sensitive
-                        // formatting: a leading space/tab/ideographic-space or <size=...> prefix means
-                        // the game reserves room for an inline icon (e.g. room "Type" rows) or hand-tuned
-                        // spacing. Shrinking that prefix would let text overlap the icon. Such strings are
-                        // short and never overflow, so they don't need the 80% reduction anyway.
-                        bool skipWrap = ja.Length == 0 || ja[0] == ' ' || ja[0] == '\t'
-                                        || ja[0] == '　' || ja.StartsWith("<size=");
+                        // Skip the <size=80%> wrapper ONLY for strings that are already size-tagged
+                        // (start with "<size=") or that carry an inline-icon reservation marker
+                        // (a leading "<size=N> </size>", used by short room "Type" rows).
+                        // A plain leading indent (e.g. the fruit letter body "        果物…") must NOT
+                        // be excluded: it is long body text that needs the 80% reduction to avoid
+                        // overflowing into fixed-position elements placed below it.
+                        bool hasIconMarker = System.Text.RegularExpressions.Regex.IsMatch(ja, @"^\s*<size=[\d.]+> </size>");
+                        bool skipWrap = ja.Length == 0 || ja.StartsWith("<size=") || hasIconMarker;
                         string jaText = skipWrap ? ja : $"<size=80%>{ja}</size>";
 
-                        // Icon-bearing "Type" rows reserve space for a left-side icon via a leading
-                        // "<size=N> </size>" marker. After swapping to NotoSansJP (whose space glyph is
-                        // narrower than the game font's), that reserve is too small and the first kanji
-                        // overlaps the icon. Prepend one ideographic space (em-width, font-independent)
-                        // to restore the clearance.
-                        if (System.Text.RegularExpressions.Regex.IsMatch(jaText, @"^\s*<size=[\d.]+> </size>"))
+                        // Icon-bearing "Type" rows: after swapping to NotoSansJP (narrower space glyph)
+                        // the reserved gap is too small and the first kanji overlaps the icon. Prepend
+                        // one ideographic space (em-width, font-independent) to restore the clearance.
+                        if (hasIconMarker)
                             jaText = "　" + jaText;
 
-                        // 1. Swap font AND material to NotoSansJP.
-                        //    Material MUST be swapped too: if the component keeps the original
-                        //    font's material, it samples the wrong atlas texture → tofu, even
-                        //    though the font/glyph data is correct.
-                        if (Plugin.JaFont != null && instance.font != null &&
-                            instance.font.GetInstanceID() != Plugin.JaFont.GetInstanceID())
+                        // Determine the component's ORIGINAL font/material so it can be restored when
+                        // showing English (NotoSansJP is wider for Latin and overflows). If the font is
+                        // already NotoSansJP (re-translation), inherit the original from the prior record.
+                        int id = instance.GetInstanceID();
+                        TMP_FontAsset origFont; Material origMat;
+                        bool isJa = Plugin.JaFont != null && instance.font != null &&
+                                    instance.font.GetInstanceID() == Plugin.JaFont.GetInstanceID();
+                        if (!isJa && instance.font != null) { origFont = instance.font; origMat = instance.fontSharedMaterial; }
+                        else if (Plugin.Swaps.TryGetValue(id, out var ex)) { origFont = ex.origFont; origMat = ex.origMat; }
+                        else { origFont = instance.font; origMat = instance.fontSharedMaterial; }
+
+                        if (Plugin.ShowOriginal)
                         {
-                            SceneLoadPatch.EnsureFallback(Plugin.JaFont, instance.font);
-                            instance.font = Plugin.JaFont;
-                            instance.fontSharedMaterial = Plugin.JaFont.material;
+                            // English mode: keep the game's own font, show original text
+                            if (origFont != null) { instance.font = origFont; instance.fontSharedMaterial = origMat; }
+                            instance.text = value;
+                        }
+                        else
+                        {
+                            // Japanese mode: swap font+material to NotoSansJP (material swap avoids tofu),
+                            // force-add glyphs to the atlas, then set the translated text.
+                            if (Plugin.JaFont != null && origFont != null &&
+                                origFont.GetInstanceID() != Plugin.JaFont.GetInstanceID())
+                            {
+                                SceneLoadPatch.EnsureFallback(Plugin.JaFont, origFont);
+                                instance.font = Plugin.JaFont;
+                                instance.fontSharedMaterial = Plugin.JaFont.material;
+                            }
+                            if (Plugin.JaFont != null)
+                                foreach (char c in jaText)
+                                    if (c >= 0x2E80) Plugin.JaFont.HasCharacter(c, false, true);
+                            instance.text = jaText;
                         }
 
-                        // 2. Force-add every Japanese char to atlas (synchronous GPU upload)
-                        if (Plugin.JaFont != null)
-                        {
-                            foreach (char c in jaText)
-                                if (c >= 0x2E80)
-                                    Plugin.JaFont.HasCharacter(c, false, true);
-                        }
-
-                        // 3. Set text
-                        instance.text = jaText;
+                        Plugin.Swaps[id] = new Plugin.TextSwap
+                        { comp = instance, orig = value, ja = jaText, origFont = origFont, origMat = origMat };
                     }
                     finally { _inPatch = false; }
                     return;
@@ -628,10 +704,6 @@ namespace BluePrinceJP
     }
 
     // ============================================================
-    // Patch: BluePrince.Language.Languages.GetText() — log and intercept
-    // ============================================================
-    [HarmonyPatch(typeof(BluePrince.Language.Languages), nameof(BluePrince.Language.Languages.GetText))]
-    // ============================================================
     // Patch: TMP_Text.set_font — detect/block game resetting font on Japanese-text components
     // ============================================================
     [HarmonyPatch(typeof(TMPro.TMP_Text), "set_font")]
@@ -657,6 +729,10 @@ namespace BluePrinceJP
         }
     }
 
+    // ============================================================
+    // Patch: BluePrince.Language.Languages.GetText() — log and intercept
+    // ============================================================
+    [HarmonyPatch(typeof(BluePrince.Language.Languages), nameof(BluePrince.Language.Languages.GetText))]
     public static class GetTextPatch
     {
         private static readonly System.Collections.Generic.HashSet<string> Logged = new();
@@ -678,6 +754,47 @@ namespace BluePrinceJP
             }
             else if (__result != null && TmpTextSetTextPatch.ShouldCollect(__result))
                 Plugin.CollectText(__result);
+        }
+    }
+
+    // ============================================================
+    // Delayed diagnostics behaviour: logs a queued text component's layout once
+    // Unity has actually laid it out (rect becomes non-zero), or after a timeout.
+    // ============================================================
+    // ============================================================
+    // Runtime behaviour: toggles all translated text between Japanese and
+    // original English when the configured key is pressed (toggle, not hold).
+    // ============================================================
+    public class BpjpRuntime : MonoBehaviour
+    {
+        public BpjpRuntime(IntPtr ptr) : base(ptr) { }
+
+        private void Update()
+        {
+            try
+            {
+                if (IsToggleDown())
+                {
+                    Plugin.ShowOriginal = !Plugin.ShowOriginal;
+                    Plugin.ApplySwaps();
+                    Plugin.Log.LogInfo($"[TOGGLE] ShowOriginal={Plugin.ShowOriginal} ({Plugin.Swaps.Count} entries)");
+                }
+            }
+            catch (Exception e) { Plugin.Log.LogWarning($"[TOGGLE] {e.Message}"); }
+        }
+
+        private static bool IsToggleDown()
+        {
+            if (Plugin.ToggleKey == null) return false;
+            var k = Plugin.ToggleKey.Value;
+            // Ctrl / Shift / Alt: accept either left or right variant.
+            if (k == KeyCode.LeftControl || k == KeyCode.RightControl)
+                return Input.GetKeyDown(KeyCode.LeftControl) || Input.GetKeyDown(KeyCode.RightControl);
+            if (k == KeyCode.LeftShift || k == KeyCode.RightShift)
+                return Input.GetKeyDown(KeyCode.LeftShift) || Input.GetKeyDown(KeyCode.RightShift);
+            if (k == KeyCode.LeftAlt || k == KeyCode.RightAlt)
+                return Input.GetKeyDown(KeyCode.LeftAlt) || Input.GetKeyDown(KeyCode.RightAlt);
+            return Input.GetKeyDown(k);
         }
     }
 }

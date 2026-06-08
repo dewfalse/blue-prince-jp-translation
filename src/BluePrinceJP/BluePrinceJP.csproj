@@ -84,6 +84,12 @@
       <Private>false</Private>
     </Reference>
 
+    <!-- Legacy Input (UnityEngine.Input.GetKeyDown for the EN/JP toggle key) -->
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(InteropDir)\UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
     <!-- Unity engine -->
     <Reference Include="UnityEngine.CoreModule">
       <HintPath>$(InteropDir)\UnityEngine.CoreModule.dll</HintPath>
